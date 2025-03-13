@@ -23,8 +23,10 @@ Steps:
          "command": "/absolute/path/to/python",
          "args": ["/absolute/path/to/database_read.py"],
          "env": {
-           "DATABASE_URL": "postgresql://username:password@hostname:port/database",
-           "PYTHONUNBUFFERED": "1"
+           "PYTHONPATH": "/absolute/path/to/project",
+           "PYTHONUNBUFFERED": "1",
+           "MCP_SERVER_MODE": "stdio",
+           "DATABASE_URL": "postgresql://username:password@hostname:port/database"
          }
        }
      }
