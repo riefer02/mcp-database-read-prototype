@@ -1,6 +1,6 @@
 from typing import Any, Dict, List
 import os
-import httpx
+import re
 from sqlalchemy import create_engine, text
 from mcp.server.fastmcp import FastMCP
 
@@ -36,18 +36,40 @@ def execute_query(query: str, params: Dict[str, Any] = None) -> List[Dict[str, A
             "Database connection not configured. Please set DATABASE_URL in .env file."
         )
 
-    # Ensure query is read-only by checking for write operations
-    query_upper = query.upper()
-    if any(
-        op in query_upper
-        for op in ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE"]
-    ):
+    # Ensure query is read-only by checking for write operations using word boundaries
+    # This prevents false positives like matching "DELETE" inside "is_deleted"
+    write_ops_pattern = re.compile(
+        r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE)\b",
+        flags=re.IGNORECASE,
+    )
+    if write_ops_pattern.search(query):
         raise ValueError("Only read operations are allowed")
 
+    # Allow querying from information_schema and pg_ system catalogs
+    query_upper = query.upper()
+    is_system_query = "INFORMATION_SCHEMA" in query_upper or "PG_" in query_upper
+
+    # Permit standard SELECT and WITH ... SELECT queries (reject WITH ... INSERT/DELETE/etc.)
+    is_select_like = bool(
+        re.match(r"^\s*(SELECT\b|WITH\b[\s\S]+?SELECT\b)", query, flags=re.IGNORECASE)
+    )
+    if not (is_system_query or is_select_like):
+        raise ValueError(
+            "Only SELECT operations and system catalog queries are allowed"
+        )
+
     with engine.connect() as connection:
-        result = connection.execute(text(query), params or {})
-        # Convert result to list of dictionaries
-        return [dict(row._mapping) for row in result]
+        # Enforce a read-only transaction at the database level (defense in depth)
+        trans = connection.begin()
+        try:
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+            result = connection.execute(text(query), params or {})
+            rows = [dict(row._mapping) for row in result]
+            trans.commit()
+            return rows
+        except Exception:
+            trans.rollback()
+            raise
 
 
 # Function to get table names from the database
