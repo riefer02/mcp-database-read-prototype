@@ -4,6 +4,7 @@ import re
 from sqlalchemy import create_engine, text
 from mcp.server.fastmcp import FastMCP
 import signal
+import time
 
 # Initialize FastMCP server
 mcp = FastMCP("database_read")
@@ -13,10 +14,11 @@ mcp = FastMCP("database_read")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Safety configuration (env-overridable defaults)
-DEFAULT_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
-DEFAULT_LOCK_TIMEOUT_MS = int(os.getenv("DB_LOCK_TIMEOUT_MS", "10000"))
+# Best-practice defaults aimed at real-world reads while preventing runaway operations
+DEFAULT_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "60000"))
+DEFAULT_LOCK_TIMEOUT_MS = int(os.getenv("DB_LOCK_TIMEOUT_MS", "15000"))
 DEFAULT_IDLE_IN_TXN_TIMEOUT_MS = int(
-    os.getenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "30000")
+    os.getenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "60000")
 )
 
 DEFAULT_MAX_ROWS = int(os.getenv("DB_MAX_ROWS", "10000"))
@@ -85,6 +87,23 @@ def _wrap_select_with_limit(query: str, limit: int) -> str:
     return f"SELECT * FROM ({inner}) AS subquery LIMIT :_row_limit"
 
 
+def _attempt_cancel(connection) -> None:
+    """
+    Best-effort cancel of the in-flight query at the driver level (psycopg2).
+    Safe to call in error paths.
+    """
+    try:
+        # SQLAlchemy Connection -> DBAPI connection is usually at .connection.connection
+        dbapi_conn = getattr(
+            getattr(connection, "connection", None), "connection", None
+        )
+        if dbapi_conn and hasattr(dbapi_conn, "cancel"):
+            dbapi_conn.cancel()
+    except Exception:
+        # Swallow any errors – this is best-effort only
+        pass
+
+
 # Function to execute a SQL query and return results
 def execute_query(
     query: str,
@@ -147,6 +166,7 @@ def execute_query(
 
     with engine.connect() as connection:
         trans = connection.begin()
+        result = None
         try:
             # Enforce read-only and strict timeouts inside the transaction
             connection.execute(text("SET TRANSACTION READ ONLY"))
@@ -171,8 +191,16 @@ def execute_query(
             fetched = 0
             batch_size = max(1, DEFAULT_FETCHMANY_SIZE)
 
+            # Wall-clock deadline as an extra safety net
+            deadline_seconds = time.monotonic() + (int(effective_timeout_ms) / 1000.0)
+
             # Stream in batches to avoid memory blowups
             while True:
+                if time.monotonic() > deadline_seconds:
+                    raise TimeoutError(
+                        "Client-side timeout exceeded while fetching results"
+                    )
+
                 batch = result.mappings().fetchmany(batch_size)
                 if not batch:
                     break
@@ -186,11 +214,21 @@ def execute_query(
 
             trans.commit()
             return rows
+        except (QueryCancelled, TimeoutError):
+            try:
+                _attempt_cancel(connection)
+            finally:
+                trans.rollback()
+            raise
         except Exception:
             trans.rollback()
             raise
         finally:
-            _restore_signal_handlers(prev_int, prev_term)
+            try:
+                if result is not None:
+                    result.close()
+            finally:
+                _restore_signal_handlers(prev_int, prev_term)
 
 
 # Function to get table names from the database
@@ -282,6 +320,7 @@ def handle_database_query(query: str) -> Dict[str, Any]:
             "count": len(results),
             "truncated": truncated,
             "max_rows": DEFAULT_MAX_ROWS,
+            "statement_timeout_ms": DEFAULT_STATEMENT_TIMEOUT_MS,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
