@@ -1,8 +1,9 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import os
 import re
 from sqlalchemy import create_engine, text
 from mcp.server.fastmcp import FastMCP
+import signal
 
 # Initialize FastMCP server
 mcp = FastMCP("database_read")
@@ -11,16 +12,87 @@ mcp = FastMCP("database_read")
 # Note: We had to change the URL from "postgres://" to "postgresql://" to work with SQLAlchemy
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Initialize database connection
+# Safety configuration (env-overridable defaults)
+DEFAULT_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "30000"))
+DEFAULT_LOCK_TIMEOUT_MS = int(os.getenv("DB_LOCK_TIMEOUT_MS", "10000"))
+DEFAULT_IDLE_IN_TXN_TIMEOUT_MS = int(
+    os.getenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "30000")
+)
+
+DEFAULT_MAX_ROWS = int(os.getenv("DB_MAX_ROWS", "10000"))
+DEFAULT_FETCHMANY_SIZE = int(os.getenv("DB_FETCHMANY_SIZE", "1000"))
+
+POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "2"))
+POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
+
+
+# Initialize database connection with safe defaults
 engine = (
-    create_engine(DATABASE_URL, connect_args={"application_name": "mcp_read_only"})
+    create_engine(
+        DATABASE_URL,
+        connect_args={
+            "application_name": "mcp_read_only",
+            # Apply baseline timeouts at connection level for defense-in-depth
+            "options": "-c statement_timeout={st} -c lock_timeout={lt} -c idle_in_transaction_session_timeout={it}".format(
+                st=DEFAULT_STATEMENT_TIMEOUT_MS,
+                lt=DEFAULT_LOCK_TIMEOUT_MS,
+                it=DEFAULT_IDLE_IN_TXN_TIMEOUT_MS,
+            ),
+        },
+        pool_pre_ping=True,
+        pool_size=POOL_SIZE,
+        max_overflow=MAX_OVERFLOW,
+        pool_timeout=POOL_TIMEOUT,
+        pool_recycle=POOL_RECYCLE,
+    )
     if DATABASE_URL
     else None
 )
 
 
+class QueryCancelled(Exception):
+    pass
+
+
+def _install_cancellation_handlers():
+    previous_int = signal.getsignal(signal.SIGINT)
+    previous_term = signal.getsignal(signal.SIGTERM)
+
+    def _cancel_handler(signum, frame):
+        raise QueryCancelled("Operation cancelled by signal")
+
+    signal.signal(signal.SIGINT, _cancel_handler)
+    signal.signal(signal.SIGTERM, _cancel_handler)
+    return previous_int, previous_term
+
+
+def _restore_signal_handlers(prev_int, prev_term):
+    signal.signal(signal.SIGINT, prev_int)
+    signal.signal(signal.SIGTERM, prev_term)
+
+
+def _strip_trailing_semicolon(sql: str) -> str:
+    return re.sub(r";\s*$", "", sql)
+
+
+def _wrap_select_with_limit(query: str, limit: int) -> str:
+    """
+    Wrap a SELECT/WITH query to enforce a hard LIMIT server-side.
+    """
+    inner = _strip_trailing_semicolon(query)
+    return f"SELECT * FROM ({inner}) AS subquery LIMIT :_row_limit"
+
+
 # Function to execute a SQL query and return results
-def execute_query(query: str, params: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+def execute_query(
+    query: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    max_rows: Optional[int] = None,
+    statement_timeout_ms: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
     Execute a SQL query against the database and return the results.
 
@@ -58,18 +130,67 @@ def execute_query(query: str, params: Dict[str, Any] = None) -> List[Dict[str, A
             "Only SELECT operations and system catalog queries are allowed"
         )
 
+    effective_max_rows = max_rows if max_rows is not None else DEFAULT_MAX_ROWS
+    effective_timeout_ms = (
+        statement_timeout_ms
+        if statement_timeout_ms is not None
+        else DEFAULT_STATEMENT_TIMEOUT_MS
+    )
+
+    # Server-side cap the result set
+    safe_query = _wrap_select_with_limit(query, effective_max_rows)
+    exec_params = dict(params or {})
+    exec_params["_row_limit"] = effective_max_rows
+
+    # Install cancellation handlers for graceful interruption
+    prev_int, prev_term = _install_cancellation_handlers()
+
     with engine.connect() as connection:
-        # Enforce a read-only transaction at the database level (defense in depth)
         trans = connection.begin()
         try:
+            # Enforce read-only and strict timeouts inside the transaction
             connection.execute(text("SET TRANSACTION READ ONLY"))
-            result = connection.execute(text(query), params or {})
-            rows = [dict(row._mapping) for row in result]
+            connection.execute(
+                text("SET LOCAL statement_timeout = :timeout_ms"),
+                {"timeout_ms": int(effective_timeout_ms)},
+            )
+            connection.execute(
+                text("SET LOCAL lock_timeout = :lock_ms"),
+                {"lock_ms": int(DEFAULT_LOCK_TIMEOUT_MS)},
+            )
+            connection.execute(
+                text("SET LOCAL idle_in_transaction_session_timeout = :idle_ms"),
+                {"idle_ms": int(DEFAULT_IDLE_IN_TXN_TIMEOUT_MS)},
+            )
+
+            result = connection.execution_options(stream_results=True).execute(
+                text(safe_query), exec_params
+            )
+
+            rows: List[Dict[str, Any]] = []
+            fetched = 0
+            batch_size = max(1, DEFAULT_FETCHMANY_SIZE)
+
+            # Stream in batches to avoid memory blowups
+            while True:
+                batch = result.mappings().fetchmany(batch_size)
+                if not batch:
+                    break
+                for row in batch:
+                    rows.append(dict(row))
+                    fetched += 1
+                    if fetched >= effective_max_rows:
+                        break
+                if fetched >= effective_max_rows:
+                    break
+
             trans.commit()
             return rows
         except Exception:
             trans.rollback()
             raise
+        finally:
+            _restore_signal_handlers(prev_int, prev_term)
 
 
 # Function to get table names from the database
@@ -154,7 +275,14 @@ def handle_database_query(query: str) -> Dict[str, Any]:
     """
     try:
         results = execute_query(query)
-        return {"status": "success", "results": results, "count": len(results)}
+        truncated = len(results) >= DEFAULT_MAX_ROWS
+        return {
+            "status": "success",
+            "results": results,
+            "count": len(results),
+            "truncated": truncated,
+            "max_rows": DEFAULT_MAX_ROWS,
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
