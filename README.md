@@ -8,13 +8,13 @@ You need:
 
 - Python 3.10+
 - PostgreSQL database
-- Cursor IDE
+- An MCP-compatible client (e.g., Cursor)
 
 Steps:
 
 1. Clone this repo
 2. Run `pip install -r requirements.txt`
-3. Create `.cursor/mcp.json` with your database connection:
+3. Create your MCP client config (example for Cursor at `.cursor/mcp.json`) with your database connection. Use placeholders and keep real credentials out of version control:
 
    ```json
    {
@@ -27,16 +27,16 @@ Steps:
            "PYTHONUNBUFFERED": "1",
            "MCP_SERVER_MODE": "stdio",
            "DATABASE_TARGET_ENV": "staging",
-           "DATABASE_URL_LOCAL": "postgresql://local_user:local_pass@localhost:5432/local_db",
-           "DATABASE_URL_STAGING": "postgresql://staging_user:staging_pass@staging-host:5432/staging_db",
-           "DATABASE_URL_PRODUCTION": "postgresql://prod_user:prod_pass@prod-host:5432/prod_db"
+           "DATABASE_URL_LOCAL": "postgresql://user:password@localhost:5432/db_name",
+           "DATABASE_URL_STAGING": "postgresql://user:password@db.example.com:5432/db_name",
+           "DATABASE_URL_PRODUCTION": "postgresql://user:password@db.example.com:5432/db_name"
          }
        }
      }
    }
    ```
 
-4. Restart Cursor
+4. Restart your client (e.g., Cursor)
 5. Ask the Agent to query your database
 
 ## Switching Between Environments
@@ -73,6 +73,7 @@ Steps:
 ## Important Notes
 
 - SQLAlchemy requires `postgresql://` not `postgres://` in connection strings
-- All paths in the Cursor config must be absolute
-- Restart Cursor after adding the configuration
+- All paths in the client config must be absolute
+- Restart your client after adding the configuration
 - The .env file is not needed when using with Cursor
+- Do not commit real credentials; use environment variables or a secret manager in production
