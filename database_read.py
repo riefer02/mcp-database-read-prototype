@@ -2,10 +2,31 @@ from typing import Any, Dict, List, Optional
 import os
 import re
 import sys
+import logging
+import json
+from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 from mcp.server.fastmcp import FastMCP
 import signal
 import time
+
+# Configure structured logging to stderr
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    stream=sys.stderr
+)
+logger = logging.getLogger("database_read")
+
+
+def log_event(event_type: str, **kwargs):
+    """Emit structured JSON log event to stderr."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "event": event_type,
+        **kwargs
+    }
+    logger.info(json.dumps(entry))
 
 # Initialize FastMCP server
 mcp = FastMCP("database_read")
@@ -76,6 +97,17 @@ def _discover_database_urls() -> Dict[str, str]:
 DATABASE_URLS = _discover_database_urls()
 _ENGINE_CACHE: Dict[str, Any] = {}
 
+# Validate at startup - fail fast if no databases configured
+if not DATABASE_URLS:
+    log_event("startup_failed", reason="no_database_urls")
+    print(
+        "ERROR: No database URLs configured.\n"
+        "Set DATABASE_URL or DATABASE_URL_<ENV> environment variables.\n"
+        "Example: DATABASE_URL_LOCAL=postgresql://user:pass@localhost:5432/db",
+        file=sys.stderr
+    )
+    sys.exit(1)
+
 
 def _available_envs_description() -> str:
     if not DATABASE_URLS:
@@ -120,9 +152,11 @@ def _get_engine(requested_env: Optional[str] = None):
     database_url = DATABASE_URLS.get(target_env)
 
     if database_url is None:
+        available = _available_envs_description()
         raise ValueError(
-            f"No database URL configured for environment '{target_env}'. "
-            f"Available environments: { _available_envs_description() }"
+            f"No database URL for environment '{target_env}'. "
+            f"Available: {available}. "
+            f"Set DATABASE_URL_{target_env.upper()} or check spelling."
         )
 
     if target_env not in _ENGINE_CACHE:
@@ -204,14 +238,20 @@ def execute_query(
     """
     engine = _get_engine(environment)
 
+    target_env = _resolve_requested_environment(environment)
+    start_time = time.monotonic()
+
     # Ensure query is read-only by checking for write operations using word boundaries
     # This prevents false positives like matching "DELETE" inside "is_deleted"
     write_ops_pattern = re.compile(
         r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE)\b",
         flags=re.IGNORECASE,
     )
-    if write_ops_pattern.search(query):
-        raise ValueError("Only read operations are allowed")
+    match = write_ops_pattern.search(query)
+    if match:
+        blocked_op = match.group(1).upper()
+        log_event("query_blocked", operation=blocked_op, query_preview=query[:100])
+        raise ValueError(f"Write operation '{blocked_op}' not allowed. Only SELECT queries permitted.")
 
     # Allow querying from information_schema and pg_ system catalogs
     query_upper = query.upper()
@@ -290,14 +330,38 @@ def execute_query(
                     break
 
             trans.commit()
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+            log_event("query_executed",
+                environment=target_env,
+                duration_ms=elapsed_ms,
+                row_count=len(rows),
+                truncated=len(rows) >= effective_max_rows,
+                query_preview=query[:100]
+            )
             return rows
-        except (QueryCancelled, TimeoutError):
+        except (QueryCancelled, TimeoutError) as e:
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+            log_event("query_failed",
+                environment=target_env,
+                duration_ms=elapsed_ms,
+                error_type=type(e).__name__,
+                error_message=str(e),
+                query_preview=query[:100]
+            )
             try:
                 _attempt_cancel(connection)
             finally:
                 trans.rollback()
             raise
-        except Exception:
+        except Exception as e:
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+            log_event("query_failed",
+                environment=target_env,
+                duration_ms=elapsed_ms,
+                error_type=type(e).__name__,
+                error_message=str(e),
+                query_preview=query[:100]
+            )
             trans.rollback()
             raise
         finally:
@@ -389,6 +453,41 @@ def get_primary_keys(
     """
     results = execute_query(query, {"table_name": table_name}, environment=environment)
     return [row["column_name"] for row in results]
+
+
+@mcp.tool("health_check")
+def handle_health_check(environment: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Check database connectivity and server health.
+
+    Args:
+        environment: Optional environment to check (defaults to current)
+
+    Returns:
+        Health status with connection info
+    """
+    target_env = _resolve_requested_environment(environment)
+    try:
+        engine = _get_engine(environment)
+
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT 1"))
+            result.fetchone()
+
+        return {
+            "status": "healthy",
+            "environment": target_env,
+            "available_environments": list(DATABASE_URLS.keys()),
+            "pool_size": POOL_SIZE,
+            "statement_timeout_ms": DEFAULT_STATEMENT_TIMEOUT_MS,
+            "max_rows": DEFAULT_MAX_ROWS
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "environment": target_env,
+            "error": str(e)
+        }
 
 
 # Example MCP tool handler for database queries
@@ -512,8 +611,15 @@ def handle_get_all_schemas(environment: Optional[str] = None) -> Dict[str, Any]:
 
 # If this file is run directly, start the MCP server
 if __name__ == "__main__":
+    log_event("server_starting",
+        environments=list(DATABASE_URLS.keys()),
+        statement_timeout_ms=DEFAULT_STATEMENT_TIMEOUT_MS,
+        max_rows=DEFAULT_MAX_ROWS,
+        pool_size=POOL_SIZE
+    )
     print("Starting Database Read MCP Server...", file=sys.stderr, flush=True)
     print("Available tools:", file=sys.stderr, flush=True)
+    print("  - health_check: Check database connectivity and server health", file=sys.stderr, flush=True)
     print("  - database_query: Execute read-only SQL queries", file=sys.stderr, flush=True)
     print("  - list_tables: List all tables in the database", file=sys.stderr, flush=True)
     print("  - get_table_schema: Get schema for a specific table", file=sys.stderr, flush=True)
