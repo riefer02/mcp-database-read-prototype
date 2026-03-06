@@ -9,15 +9,13 @@ This is a Model Context Protocol (MCP) server providing read-only PostgreSQL dat
 ## Development Setup
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
 
 ## Running the Server
 
 ```bash
-python database_read.py
+uv run python database_read.py
 ```
 
 The server communicates via stdio and requires database connection strings via environment variables:
@@ -27,7 +25,7 @@ The server communicates via stdio and requires database connection strings via e
 
 ## Architecture
 
-**Single-file architecture**: All server logic lives in `database_read.py` (~520 lines).
+**Single-file architecture**: All server logic lives in `database_read.py` (~629 lines).
 
 ### Key Components
 
@@ -46,7 +44,8 @@ The server communicates via stdio and requires database connection strings via e
    - Stream-based result fetching with batch processing
    - Signal handlers (SIGINT/SIGTERM) for query cancellation
 
-4. **MCP Tools** (lines 395-522):
+4. **MCP Tools** (lines 395-629):
+   - `health_check`: Check database connectivity and server health
    - `database_query`: Execute SELECT queries with optional environment override
    - `list_tables`: List public schema tables
    - `get_table_schema`: Column metadata + primary keys for a table
@@ -71,6 +70,6 @@ No formal test suite. Smoke test via MCP client:
 
 ## Key Dependencies
 
-- `mcp==1.4.0` - MCP protocol (FastMCP)
-- `SQLAlchemy==2.0.39` - Database abstraction
-- `psycopg2-binary==2.9.10` - PostgreSQL driver
+- `mcp[cli]>=1.26.0` - MCP protocol (FastMCP)
+- `SQLAlchemy>=2.0.39` - Database abstraction
+- `psycopg2-binary>=2.9.10` - PostgreSQL driver

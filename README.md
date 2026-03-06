@@ -13,13 +13,12 @@ A simple Model Context Protocol (MCP) server for read-only PostgreSQL database a
 - Python 3.10+
 - PostgreSQL database
 - An MCP-compatible client (Cursor, Claude Desktop, Codex, etc.)
+- [`uv`](https://docs.astral.sh/uv/) for project management
 
 ## Install
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
 
 ## Configure the database connection
@@ -49,10 +48,9 @@ Example `.cursor/mcp.json`:
 {
   "mcpServers": {
     "database-reader": {
-      "command": "${workspaceFolder}/.venv/bin/python",
-      "args": ["${workspaceFolder}/database_read.py"],
+      "command": "uv",
+      "args": ["--directory", "${workspaceFolder}", "run", "database_read.py"],
       "env": {
-        "PYTHONUNBUFFERED": "1",
         "DATABASE_TARGET_ENV": "local",
         "DATABASE_URL_LOCAL": "${env:DATABASE_URL_LOCAL}",
         "DATABASE_URL_STAGING": "${env:DATABASE_URL_STAGING}",
@@ -81,10 +79,9 @@ Example `claude_desktop_config.json`:
 {
   "mcpServers": {
     "database-reader": {
-      "command": "/ABSOLUTE/PATH/TO/.venv/bin/python",
-      "args": ["/ABSOLUTE/PATH/TO/mcp-prototype/database_read.py"],
+      "command": "uv",
+      "args": ["--directory", "/ABSOLUTE/PATH/TO/mcp-prototype", "run", "database_read.py"],
       "env": {
-        "PYTHONUNBUFFERED": "1",
         "DATABASE_TARGET_ENV": "local",
         "DATABASE_URL_LOCAL": "postgresql://user:password@localhost:5432/db_name"
       }
@@ -110,18 +107,17 @@ Option A — configure via CLI:
 codex mcp add database-reader \
   --env DATABASE_TARGET_ENV=local \
   --env DATABASE_URL_LOCAL='postgresql://user:password@localhost:5432/db_name' \
-  -- python /ABSOLUTE/PATH/TO/mcp-prototype/database_read.py
+  -- uv --directory /ABSOLUTE/PATH/TO/mcp-prototype run database_read.py
 ```
 
 Option B — configure via `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.database-reader]
-command = "python"
-args = ["/ABSOLUTE/PATH/TO/mcp-prototype/database_read.py"]
+command = "uv"
+args = ["--directory", "/ABSOLUTE/PATH/TO/mcp-prototype", "run", "database_read.py"]
 
 [mcp_servers.database-reader.env]
-PYTHONUNBUFFERED = "1"
 DATABASE_TARGET_ENV = "local"
 DATABASE_URL_LOCAL = "postgresql://user:password@localhost:5432/db_name"
 ```
@@ -130,8 +126,8 @@ DATABASE_URL_LOCAL = "postgresql://user:password@localhost:5432/db_name"
 
 If your client supports **STDIO MCP servers**, it will typically accept the same fields:
 
-- `command`: executable to start the server (often `python`)
-- `args`: arguments (the first arg is typically the path to `database_read.py`)
+- `command`: `uv`
+- `args`: `["--directory", "/path/to/mcp-prototype", "run", "database_read.py"]`
 - `env`: environment variables (at least `DATABASE_URL` or `DATABASE_URL_<ENV>`)
 
 Use the **Cursor / Claude Desktop JSON** examples above (same `mcpServers` shape), or the **Codex `config.toml`** example if your client uses TOML.
@@ -148,6 +144,7 @@ To test multi-env selection, pass `environment: "staging"` in the tool call argu
 
 ## Available Tools
 
+- **health_check**: Check database connectivity and server health
 - **database_query**: Run read-only SQL queries
 - **list_tables**: List all tables in the database
 - **get_table_schema**: Get schema for a specific table (includes primary keys)

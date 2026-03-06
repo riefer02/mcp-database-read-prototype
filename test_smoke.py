@@ -167,28 +167,19 @@ def test_improved_error_message_format():
     assert "Only SELECT queries permitted" in source, "Missing SELECT hint in error"
 
 
-def test_requirements_cleanup():
-    """Unused dependencies should be removed from requirements.txt."""
-    req_file = os.path.join(SCRIPT_DIR, "requirements.txt")
-    with open(req_file, 'r') as f:
-        requirements = f.read()
+def test_pyproject_toml_exists():
+    """pyproject.toml should exist with essential dependencies."""
+    pyproject_file = os.path.join(SCRIPT_DIR, "pyproject.toml")
+    assert os.path.exists(pyproject_file), "pyproject.toml not found"
 
-    removed_packages = [
-        "uvicorn",
-        "starlette",
-        "typer",
-        "rich",
-        "Pygments",
-        "shellingham",
-    ]
+    with open(pyproject_file, 'r') as f:
+        content = f.read()
 
-    for pkg in removed_packages:
-        assert pkg not in requirements, f"Package '{pkg}' should be removed from requirements.txt"
+    required_deps = ["mcp", "sqlalchemy", "psycopg2-binary"]
+    for dep in required_deps:
+        assert dep in content, f"Dependency '{dep}' should be in pyproject.toml"
 
-    # Check essential packages are still there
-    required_packages = ["mcp", "SQLAlchemy", "psycopg2-binary", "pydantic"]
-    for pkg in required_packages:
-        assert pkg in requirements, f"Package '{pkg}' should be in requirements.txt"
+    assert "requires-python" in content, "requires-python should be specified"
 
 
 def main():
@@ -201,7 +192,7 @@ def main():
         ("Log event produces valid JSON", test_log_event_format),
         ("Health check tool exists", test_health_check_function_exists),
         ("Improved error message format", test_improved_error_message_format),
-        ("Requirements cleanup", test_requirements_cleanup),
+        ("pyproject.toml exists with deps", test_pyproject_toml_exists),
     ]
 
     passed = 0
