@@ -83,7 +83,9 @@ Example `claude_desktop_config.json`:
       "args": ["--directory", "/ABSOLUTE/PATH/TO/mcp-prototype", "run", "database_read.py"],
       "env": {
         "DATABASE_TARGET_ENV": "local",
-        "DATABASE_URL_LOCAL": "postgresql://user:password@localhost:5432/db_name"
+        "DATABASE_URL_LOCAL": "postgresql://user:password@localhost:5432/db_name",
+        "DATABASE_URL_STAGING": "postgresql://user:password@staging-host:5432/db_name",
+        "DATABASE_URL_PRODUCTION": "postgresql://user:password@prod-host:5432/db_name"
       }
     }
   }
@@ -94,6 +96,7 @@ Notes:
 
 - Claude Desktop commonly requires **absolute paths** in JSON.
 - Restart Claude Desktop after editing the config.
+- `DATABASE_TARGET_ENV` sets the default; tools can override per-call with `environment: "staging"` etc.
 
 ### OpenAI Codex (CLI + IDE extension)
 
@@ -107,6 +110,8 @@ Option A — configure via CLI:
 codex mcp add database-reader \
   --env DATABASE_TARGET_ENV=local \
   --env DATABASE_URL_LOCAL='postgresql://user:password@localhost:5432/db_name' \
+  --env DATABASE_URL_STAGING='postgresql://user:password@staging-host:5432/db_name' \
+  --env DATABASE_URL_PRODUCTION='postgresql://user:password@prod-host:5432/db_name' \
   -- uv --directory /ABSOLUTE/PATH/TO/mcp-prototype run database_read.py
 ```
 
@@ -120,6 +125,8 @@ args = ["--directory", "/ABSOLUTE/PATH/TO/mcp-prototype", "run", "database_read.
 [mcp_servers.database-reader.env]
 DATABASE_TARGET_ENV = "local"
 DATABASE_URL_LOCAL = "postgresql://user:password@localhost:5432/db_name"
+DATABASE_URL_STAGING = "postgresql://user:password@staging-host:5432/db_name"
+DATABASE_URL_PRODUCTION = "postgresql://user:password@prod-host:5432/db_name"
 ```
 
 ### Other MCP clients (Claude Code, OpenCode, etc.)
