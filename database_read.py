@@ -1,44 +1,45 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import os
 import re
 import sys
 import logging
 import json
-from datetime import datetime, timezone
+import atexit
+import base64
+import threading
+from datetime import datetime, timezone, date, time as dtime
+from decimal import Decimal
+from uuid import UUID
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 from mcp.server.fastmcp import FastMCP
 import signal
+import sqlparse
+from sqlparse import tokens as T
 import time
 
-# Configure structured logging to stderr
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s',
-    stream=sys.stderr
-)
+# Structured logging to stderr
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("database_read")
 
 
 def log_event(event_type: str, **kwargs):
-    """Emit structured JSON log event to stderr."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "event": event_type,
-        **kwargs
+        **kwargs,
     }
-    logger.info(json.dumps(entry))
+    logger.info(json.dumps(entry, default=str))
 
-# Initialize FastMCP server
+
 mcp = FastMCP("database_read")
 
-# Safety configuration (env-overridable defaults). These defaults err on the side
-# of protecting production systems from runaway read workloads.
+# Safety configuration
 DEFAULT_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "60000"))
 DEFAULT_LOCK_TIMEOUT_MS = int(os.getenv("DB_LOCK_TIMEOUT_MS", "15000"))
 DEFAULT_IDLE_IN_TXN_TIMEOUT_MS = int(
     os.getenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "60000")
 )
-
 DEFAULT_MAX_ROWS = int(os.getenv("DB_MAX_ROWS", "10000"))
 DEFAULT_FETCHMANY_SIZE = int(os.getenv("DB_FETCHMANY_SIZE", "1000"))
 
@@ -47,7 +48,17 @@ MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "2"))
 POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
 POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
 
-# Environment selection + pooling helpers
+
+def _parse_allowed_schemas(raw: Optional[str]) -> Tuple[str, ...]:
+    if not raw:
+        return ("public",)
+    parts = tuple(p.strip() for p in raw.split(",") if p.strip())
+    return parts or ("public",)
+
+
+ALLOWED_SCHEMAS: Tuple[str, ...] = _parse_allowed_schemas(os.getenv("DB_ALLOWED_SCHEMAS"))
+DEFAULT_SCHEMA = ALLOWED_SCHEMAS[0]
+
 ENV_SELECTOR_VARS = ("DATABASE_TARGET_ENV", "DATABASE_ENV", "DB_ENV")
 ENV_ALIAS_MAP = {
     "dev": "local",
@@ -67,46 +78,31 @@ def _normalize_env_name(env_name: Optional[str]) -> str:
     if not env_name:
         return "default"
     cleaned = env_name.strip().lower()
+    if not cleaned:
+        return "default"
     return ENV_ALIAS_MAP.get(cleaned, cleaned)
 
 
-def _discover_database_urls() -> Dict[str, str]:
-    """
-    Build a map of available database URLs discovered from environment variables.
-
-    - `DATABASE_URL` becomes the implicit `default`
-    - Any `DATABASE_URL_<ENV>` is registered under `<env>` (lowercase)
-    """
+def _discover_database_urls(environ: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Build map of envs → URLs from environment variables."""
+    env = environ if environ is not None else os.environ
     urls: Dict[str, str] = {}
-    default_url = os.getenv("DATABASE_URL")
+    default_url = env.get("DATABASE_URL")
     if default_url:
         urls["default"] = default_url
-
-    for key, value in os.environ.items():
-        if not key.startswith(DATABASE_URL_PREFIX):
+    for key, value in env.items():
+        if not key.startswith(DATABASE_URL_PREFIX) or not value:
             continue
-        suffix = key[len(DATABASE_URL_PREFIX) :].strip()
-        if not suffix or not value:
+        suffix = key[len(DATABASE_URL_PREFIX):].strip()
+        if not suffix:
             continue
-        normalized = _normalize_env_name(suffix)
-        urls[normalized] = value
-
+        urls[_normalize_env_name(suffix)] = value
     return urls
 
 
-DATABASE_URLS = _discover_database_urls()
-_ENGINE_CACHE: Dict[str, Any] = {}
-
-# Validate at startup - fail fast if no databases configured
-if not DATABASE_URLS:
-    log_event("startup_failed", reason="no_database_urls")
-    print(
-        "ERROR: No database URLs configured.\n"
-        "Set DATABASE_URL or DATABASE_URL_<ENV> environment variables.\n"
-        "Example: DATABASE_URL_LOCAL=postgresql://user:pass@localhost:5432/db",
-        file=sys.stderr
-    )
-    sys.exit(1)
+DATABASE_URLS: Dict[str, str] = _discover_database_urls()
+_ENGINE_CACHE: Dict[str, Engine] = {}
+_ENGINE_LOCK = threading.Lock()
 
 
 def _available_envs_description() -> str:
@@ -125,15 +121,15 @@ def _resolve_requested_environment(requested_env: Optional[str]) -> str:
     return _normalize_env_name(env_candidate)
 
 
-def _create_engine(database_url: str):
+def _create_engine(database_url: str) -> Engine:
     return create_engine(
         database_url,
         connect_args={
             "application_name": "mcp_read_only",
-            "options": "-c statement_timeout={st} -c lock_timeout={lt} -c idle_in_transaction_session_timeout={it}".format(
-                st=DEFAULT_STATEMENT_TIMEOUT_MS,
-                lt=DEFAULT_LOCK_TIMEOUT_MS,
-                it=DEFAULT_IDLE_IN_TXN_TIMEOUT_MS,
+            "options": (
+                f"-c statement_timeout={DEFAULT_STATEMENT_TIMEOUT_MS} "
+                f"-c lock_timeout={DEFAULT_LOCK_TIMEOUT_MS} "
+                f"-c idle_in_transaction_session_timeout={DEFAULT_IDLE_IN_TXN_TIMEOUT_MS}"
             ),
         },
         pool_pre_ping=True,
@@ -144,160 +140,332 @@ def _create_engine(database_url: str):
     )
 
 
-def _get_engine(requested_env: Optional[str] = None):
-    """
-    Lazily provision or reuse an engine for the requested environment.
-    """
+def _get_engine(requested_env: Optional[str] = None) -> Engine:
     target_env = _resolve_requested_environment(requested_env)
     database_url = DATABASE_URLS.get(target_env)
-
     if database_url is None:
-        available = _available_envs_description()
         raise ValueError(
             f"No database URL for environment '{target_env}'. "
-            f"Available: {available}. "
+            f"Available: {_available_envs_description()}. "
             f"Set DATABASE_URL_{target_env.upper()} or check spelling."
         )
+    with _ENGINE_LOCK:
+        if target_env not in _ENGINE_CACHE:
+            _ENGINE_CACHE[target_env] = _create_engine(database_url)
+        return _ENGINE_CACHE[target_env]
 
-    if target_env not in _ENGINE_CACHE:
-        _ENGINE_CACHE[target_env] = _create_engine(database_url)
 
-    return _ENGINE_CACHE[target_env]
+def _dispose_all_engines() -> None:
+    with _ENGINE_LOCK:
+        for env_name, engine in list(_ENGINE_CACHE.items()):
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+            _ENGINE_CACHE.pop(env_name, None)
+
+
+atexit.register(_dispose_all_engines)
+
+
+# SQL safety: parse-based validation
+_BLOCKED_DML = {"INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "UPSERT"}
+# Keywords that indicate state change even though they aren't classified
+# as DDL or write-DML by sqlparse. Walk every token and reject these
+# whenever the statement starts with SELECT/WITH.
+#   - INTO: traps `SELECT * INTO new_table FROM ...` (creates a table)
+#   - FOR UPDATE / FOR SHARE: row-level locks (state change on rows)
+_BLOCKED_ANY = {"INTO"}
+
+# Function calls that mutate server state, signal sessions, touch the
+# filesystem, or escape into another database. PG's READ ONLY transaction
+# does not block these because they're function calls, not DML. So we
+# refuse them at parse time. The detection is structural: a name token
+# (case-insensitive, with quotes stripped) followed by `(` inside the
+# top-level statement. Identifiers, columns, and matching substrings
+# inside string literals are intentionally NOT matched.
+_DANGEROUS_FUNCS = {
+    # Backend signaling
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_signal_backend",
+    # Server-level admin
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_promote",
+    "pg_create_restore_point",
+    "pg_switch_wal",
+    "pg_switch_xlog",
+    "pg_replication_origin_create",
+    "pg_replication_origin_drop",
+    # Filesystem access
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_stat_file",
+    # Large object I/O
+    "lo_creat", "lo_create", "lo_unlink", "lo_import", "lo_export",
+    "lo_open", "lo_close", "lo_read", "lo_write", "lo_truncate",
+    "lo_put", "lo_get", "lo_from_bytea",
+    # Cross-DB escapes
+    "dblink", "dblink_exec", "dblink_connect", "dblink_disconnect",
+    "dblink_open", "dblink_fetch", "dblink_close",
+    # Config flip
+    "set_config",
+    # Snapshot export
+    "pg_export_snapshot",
+}
+
+_TRAILING_SEMI_RE = re.compile(r";\s*$")
+
+
+def _normalize_ident_value(value: str) -> str:
+    """Strip surrounding double-quotes and lowercase a name-like token."""
+    v = value.strip()
+    if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+        v = v[1:-1].replace('""', '"')
+    return v.lower()
+
+
+def _is_skippable(tok) -> bool:
+    if tok.is_whitespace:
+        return True
+    if tok.ttype in (T.Comment, T.Comment.Single, T.Comment.Multiline):
+        return True
+    return False
+
+
+def _check_dangerous_function_calls(stmt) -> None:
+    """Walk tokens; reject `<dangerous_name> (` patterns. Skips strings/numbers."""
+    toks = [t for t in stmt.flatten() if not _is_skippable(t)]
+    for i, tok in enumerate(toks):
+        # Skip string literals + numbers + punctuation.
+        # NOTE: T.String.Symbol is sqlparse's tag for double-quoted IDENTIFIERS
+        # (e.g. "pg_terminate_backend"), so we do NOT skip it — we want those
+        # checked against the blacklist after dequoting.
+        if tok.ttype in (
+            T.String, T.String.Single,
+            T.Number, T.Number.Integer, T.Number.Float,
+            T.Punctuation,
+        ):
+            continue
+        name = _normalize_ident_value(tok.value)
+        if name not in _DANGEROUS_FUNCS:
+            continue
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if nxt is not None and nxt.ttype is T.Punctuation and nxt.value == "(":
+            raise ValueError(
+                f"Dangerous function '{name}' not allowed in read-only query"
+            )
+
+
+def _strip_trailing_semicolon(sql: str) -> str:
+    return _TRAILING_SEMI_RE.sub("", sql)
+
+
+def validate_read_only_sql(sql: str) -> None:
+    """
+    Reject anything that is not a single read-only SELECT/WITH...SELECT.
+    Raises ValueError on violation.
+    """
+    if not sql or not sql.strip():
+        raise ValueError("Empty query")
+
+    cleaned = sqlparse.format(sql, strip_comments=True).strip()
+    cleaned = _strip_trailing_semicolon(cleaned).strip()
+    if not cleaned:
+        raise ValueError("Empty query")
+
+    parsed = [s for s in sqlparse.parse(cleaned) if str(s).strip()]
+    if len(parsed) != 1:
+        raise ValueError(
+            "Multiple statements not allowed; submit one query at a time"
+        )
+    stmt = parsed[0]
+
+    first_kw = None
+    for tok in stmt.flatten():
+        if tok.is_whitespace:
+            continue
+        if tok.ttype in (T.Comment, T.Comment.Single, T.Comment.Multiline):
+            continue
+        if tok.ttype is T.Punctuation:
+            continue
+        first_kw = tok.normalized.upper()
+        break
+
+    if first_kw not in ("SELECT", "WITH"):
+        raise ValueError(
+            f"Only SELECT/WITH queries allowed (got '{first_kw}')"
+        )
+
+    for tok in stmt.flatten():
+        if tok.ttype is T.Keyword.DDL:
+            raise ValueError(
+                f"DDL '{tok.normalized.upper()}' not allowed"
+            )
+        if tok.ttype is T.Keyword.DML:
+            op = tok.normalized.upper()
+            if op in _BLOCKED_DML:
+                raise ValueError(f"Write operation '{op}' not allowed")
+        if tok.ttype is T.Keyword:
+            kw = tok.normalized.upper()
+            if kw in _BLOCKED_ANY:
+                raise ValueError(
+                    f"Disallowed keyword '{kw}' in read-only query"
+                )
+
+    _check_dangerous_function_calls(stmt)
+
+
+def _wrap_select_with_limit_offset(query: str) -> str:
+    """Wrap query with parameterized LIMIT/OFFSET. Values bound separately."""
+    inner = _strip_trailing_semicolon(query)
+    return (
+        f"SELECT * FROM ({inner}) AS _mcp_sub "
+        f"LIMIT :_row_limit OFFSET :_row_offset"
+    )
+
+
+# Value serialization for JSON-safe MCP responses
+def _jsonify_value(v: Any) -> Any:
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, Decimal):
+        return str(v)
+    if isinstance(v, (datetime, date, dtime)):
+        return v.isoformat()
+    if isinstance(v, UUID):
+        return str(v)
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(v)).decode("ascii")
+    if isinstance(v, (list, tuple)):
+        return [_jsonify_value(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _jsonify_value(val) for k, val in v.items()}
+    if isinstance(v, set):
+        return [_jsonify_value(x) for x in v]
+    return str(v)
+
+
+def _jsonify_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: _jsonify_value(v) for k, v in row.items()}
 
 
 class QueryCancelled(Exception):
     pass
 
 
-def _install_cancellation_handlers():
-    previous_int = signal.getsignal(signal.SIGINT)
-    previous_term = signal.getsignal(signal.SIGTERM)
+def _can_install_signal_handlers() -> bool:
+    """Signals can only be installed from the main thread of the main interpreter."""
+    return threading.current_thread() is threading.main_thread()
 
-    def _cancel_handler(signum, frame):
+
+def _install_cancellation_handlers():
+    if not _can_install_signal_handlers():
+        return None, None, False
+    prev_int = signal.getsignal(signal.SIGINT)
+    prev_term = signal.getsignal(signal.SIGTERM)
+
+    def _cancel(_signum, _frame):
         raise QueryCancelled("Operation cancelled by signal")
 
-    signal.signal(signal.SIGINT, _cancel_handler)
-    signal.signal(signal.SIGTERM, _cancel_handler)
-    return previous_int, previous_term
+    signal.signal(signal.SIGINT, _cancel)
+    signal.signal(signal.SIGTERM, _cancel)
+    return prev_int, prev_term, True
 
 
-def _restore_signal_handlers(prev_int, prev_term):
+def _restore_signal_handlers(prev_int, prev_term, installed):
+    if not installed:
+        return
     signal.signal(signal.SIGINT, prev_int)
     signal.signal(signal.SIGTERM, prev_term)
 
 
-def _strip_trailing_semicolon(sql: str) -> str:
-    return re.sub(r";\s*$", "", sql)
-
-
-def _wrap_select_with_limit(query: str, limit: int) -> str:
-    """
-    Wrap a SELECT/WITH query to enforce a hard LIMIT server-side.
-    """
-    inner = _strip_trailing_semicolon(query)
-    return f"SELECT * FROM ({inner}) AS subquery LIMIT :_row_limit"
-
-
 def _attempt_cancel(connection) -> None:
-    """
-    Best-effort cancel of the in-flight query at the driver level (psycopg2).
-    Safe to call in error paths.
-    """
     try:
-        # SQLAlchemy Connection -> DBAPI connection is usually at .connection.connection
-        dbapi_conn = getattr(
-            getattr(connection, "connection", None), "connection", None
-        )
+        dbapi_conn = getattr(getattr(connection, "connection", None), "connection", None)
         if dbapi_conn and hasattr(dbapi_conn, "cancel"):
             dbapi_conn.cancel()
     except Exception:
-        # Swallow any errors – this is best-effort only
         pass
 
 
-# Function to execute a SQL query and return results
+def _validate_schema(schema: Optional[str]) -> str:
+    target = schema or DEFAULT_SCHEMA
+    if target not in ALLOWED_SCHEMAS:
+        raise ValueError(
+            f"Schema '{target}' not in allowlist {list(ALLOWED_SCHEMAS)}. "
+            f"Set DB_ALLOWED_SCHEMAS to extend."
+        )
+    return target
+
+
+def _quote_ident(ident: str) -> str:
+    """Conservative PostgreSQL identifier quoting. Rejects identifiers with `\"` to prevent injection."""
+    if not isinstance(ident, str) or not ident:
+        raise ValueError("Invalid identifier")
+    if '"' in ident or "\x00" in ident:
+        raise ValueError(f"Invalid identifier: {ident!r}")
+    return '"' + ident + '"'
+
+
 def execute_query(
     query: str,
     params: Optional[Dict[str, Any]] = None,
     *,
     environment: Optional[str] = None,
     max_rows: Optional[int] = None,
+    offset: int = 0,
     statement_timeout_ms: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], bool]:
     """
-    Execute a SQL query against the database and return the results.
-
-    Args:
-        query: SQL query string
-        params: Optional parameters for the query
-        environment: Optional environment label to run the query against
-            (falls back to DATABASE_TARGET_ENV/DATABASE_ENV/DB_ENV, then default)
-
-    Returns:
-        List of dictionaries representing the query results
+    Execute a SELECT/WITH query. Returns (rows, truncated).
+    truncated == True when result hit max_rows ceiling.
     """
-    engine = _get_engine(environment)
+    validate_read_only_sql(query)
 
-    target_env = _resolve_requested_environment(environment)
-    start_time = time.monotonic()
-
-    # Ensure query is read-only by checking for write operations using word boundaries
-    # This prevents false positives like matching "DELETE" inside "is_deleted"
-    write_ops_pattern = re.compile(
-        r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE)\b",
-        flags=re.IGNORECASE,
-    )
-    match = write_ops_pattern.search(query)
-    if match:
-        blocked_op = match.group(1).upper()
-        log_event("query_blocked", operation=blocked_op, query_preview=query[:100])
-        raise ValueError(f"Write operation '{blocked_op}' not allowed. Only SELECT queries permitted.")
-
-    # Allow querying from information_schema and pg_ system catalogs
-    query_upper = query.upper()
-    is_system_query = "INFORMATION_SCHEMA" in query_upper or "PG_" in query_upper
-
-    # Permit standard SELECT and WITH ... SELECT queries (reject WITH ... INSERT/DELETE/etc.)
-    is_select_like = bool(
-        re.match(r"^\s*(SELECT\b|WITH\b[\s\S]+?SELECT\b)", query, flags=re.IGNORECASE)
-    )
-    if not (is_system_query or is_select_like):
-        raise ValueError(
-            "Only SELECT operations and system catalog queries are allowed"
-        )
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
 
     effective_max_rows = max_rows if max_rows is not None else DEFAULT_MAX_ROWS
+    if effective_max_rows <= 0:
+        raise ValueError("max_rows must be > 0")
     effective_timeout_ms = (
         statement_timeout_ms
         if statement_timeout_ms is not None
         else DEFAULT_STATEMENT_TIMEOUT_MS
     )
 
-    # Server-side cap the result set
-    safe_query = _wrap_select_with_limit(query, effective_max_rows)
-    exec_params = dict(params or {})
-    exec_params["_row_limit"] = effective_max_rows
+    engine = _get_engine(environment)
+    target_env = _resolve_requested_environment(environment)
+    start_time = time.monotonic()
 
-    # Install cancellation handlers for graceful interruption
-    prev_int, prev_term = _install_cancellation_handlers()
+    # Fetch max_rows+1 to detect truncation
+    fetch_limit = effective_max_rows + 1
+    safe_query = _wrap_select_with_limit_offset(query)
+    exec_params = dict(params or {})
+    exec_params["_row_limit"] = fetch_limit
+    exec_params["_row_offset"] = offset
+
+    prev_int, prev_term, installed = _install_cancellation_handlers()
 
     with engine.connect() as connection:
         trans = connection.begin()
         result = None
         try:
-            # Enforce read-only and strict timeouts inside the transaction
             connection.execute(text("SET TRANSACTION READ ONLY"))
             connection.execute(
-                text("SET LOCAL statement_timeout = :timeout_ms"),
-                {"timeout_ms": int(effective_timeout_ms)},
+                text("SET LOCAL statement_timeout = :t"),
+                {"t": int(effective_timeout_ms)},
             )
             connection.execute(
-                text("SET LOCAL lock_timeout = :lock_ms"),
-                {"lock_ms": int(DEFAULT_LOCK_TIMEOUT_MS)},
+                text("SET LOCAL lock_timeout = :t"),
+                {"t": int(DEFAULT_LOCK_TIMEOUT_MS)},
             )
             connection.execute(
-                text("SET LOCAL idle_in_transaction_session_timeout = :idle_ms"),
-                {"idle_ms": int(DEFAULT_IDLE_IN_TXN_TIMEOUT_MS)},
+                text("SET LOCAL idle_in_transaction_session_timeout = :t"),
+                {"t": int(DEFAULT_IDLE_IN_TXN_TIMEOUT_MS)},
             )
 
             result = connection.execution_options(stream_results=True).execute(
@@ -305,48 +473,47 @@ def execute_query(
             )
 
             rows: List[Dict[str, Any]] = []
-            fetched = 0
             batch_size = max(1, DEFAULT_FETCHMANY_SIZE)
+            deadline = time.monotonic() + (int(effective_timeout_ms) / 1000.0)
 
-            # Wall-clock deadline as an extra safety net
-            deadline_seconds = time.monotonic() + (int(effective_timeout_ms) / 1000.0)
-
-            # Stream in batches to avoid memory blowups
             while True:
-                if time.monotonic() > deadline_seconds:
-                    raise TimeoutError(
-                        "Client-side timeout exceeded while fetching results"
-                    )
-
+                if time.monotonic() > deadline:
+                    raise TimeoutError("Client-side timeout exceeded while fetching results")
                 batch = result.mappings().fetchmany(batch_size)
                 if not batch:
                     break
                 for row in batch:
-                    rows.append(dict(row))
-                    fetched += 1
-                    if fetched >= effective_max_rows:
+                    rows.append(_jsonify_row(dict(row)))
+                    if len(rows) >= fetch_limit:
                         break
-                if fetched >= effective_max_rows:
+                if len(rows) >= fetch_limit:
                     break
 
             trans.commit()
+
+            truncated = len(rows) > effective_max_rows
+            if truncated:
+                rows = rows[:effective_max_rows]
+
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
-            log_event("query_executed",
+            log_event(
+                "query_executed",
                 environment=target_env,
                 duration_ms=elapsed_ms,
                 row_count=len(rows),
-                truncated=len(rows) >= effective_max_rows,
-                query_preview=query[:100]
+                truncated=truncated,
+                query_preview=query[:100],
             )
-            return rows
+            return rows, truncated
         except (QueryCancelled, TimeoutError) as e:
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
-            log_event("query_failed",
+            log_event(
+                "query_failed",
                 environment=target_env,
                 duration_ms=elapsed_ms,
                 error_type=type(e).__name__,
                 error_message=str(e),
-                query_preview=query[:100]
+                query_preview=query[:100],
             )
             try:
                 _attempt_cancel(connection)
@@ -355,12 +522,13 @@ def execute_query(
             raise
         except Exception as e:
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
-            log_event("query_failed",
+            log_event(
+                "query_failed",
                 environment=target_env,
                 duration_ms=elapsed_ms,
                 error_type=type(e).__name__,
                 error_message=str(e),
-                query_preview=query[:100]
+                query_preview=query[:100],
             )
             trans.rollback()
             raise
@@ -369,260 +537,309 @@ def execute_query(
                 if result is not None:
                     result.close()
             finally:
-                _restore_signal_handlers(prev_int, prev_term)
+                _restore_signal_handlers(prev_int, prev_term, installed)
 
 
-# Function to get table names from the database
-def get_table_names(*, environment: Optional[str] = None) -> List[str]:
-    """
-    Get a list of all table names in the database.
-
-    Args:
-        environment: Optional environment label to inspect. When omitted,
-            falls back to DATABASE_TARGET_ENV (and its aliases), then the
-            default connection string.
-
-    Returns:
-        List of table names
-    """
-    query = """
-    SELECT table_name 
-    FROM information_schema.tables 
-    WHERE table_schema = 'public'
-    """
-    results = execute_query(query, environment=environment)
-    return [row["table_name"] for row in results]
+def get_table_names(*, environment: Optional[str] = None, schema: Optional[str] = None) -> List[str]:
+    target_schema = _validate_schema(schema)
+    rows, _ = execute_query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = :s ORDER BY table_name",
+        {"s": target_schema},
+        environment=environment,
+    )
+    return [row["table_name"] for row in rows]
 
 
-# Function to get table schema
 def get_table_schema(
-    table_name: str, *, environment: Optional[str] = None
+    table_name: str, *, environment: Optional[str] = None, schema: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """
-    Get the schema for a specific table.
-
-    Args:
-        table_name: Name of the table
-        environment: Optional environment label to inspect. When omitted,
-            falls back to DATABASE_TARGET_ENV (and its aliases), then the
-            default connection string.
-
-    Returns:
-        List of dictionaries with column information
-    """
-    query = """
-    SELECT 
-        column_name, 
-        data_type, 
-        is_nullable,
-        column_default,
-        character_maximum_length
-    FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = :table_name
-    ORDER BY ordinal_position
-    """
-    return execute_query(query, {"table_name": table_name}, environment=environment)
+    target_schema = _validate_schema(schema)
+    rows, _ = execute_query(
+        """
+        SELECT column_name, data_type, is_nullable, column_default, character_maximum_length
+        FROM information_schema.columns
+        WHERE table_schema = :s AND table_name = :t
+        ORDER BY ordinal_position
+        """,
+        {"s": target_schema, "t": table_name},
+        environment=environment,
+    )
+    return rows
 
 
-# Function to get primary key information
 def get_primary_keys(
-    table_name: str, *, environment: Optional[str] = None
+    table_name: str, *, environment: Optional[str] = None, schema: Optional[str] = None
 ) -> List[str]:
-    """
-    Get primary key columns for a table.
+    target_schema = _validate_schema(schema)
+    rows, _ = execute_query(
+        """
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+            AND tc.table_schema = :s
+            AND tc.table_name = :t
+        ORDER BY kcu.ordinal_position
+        """,
+        {"s": target_schema, "t": table_name},
+        environment=environment,
+    )
+    return [row["column_name"] for row in rows]
 
-    Args:
-        table_name: Name of the table
-        environment: Optional environment label to inspect. When omitted,
-            falls back to DATABASE_TARGET_ENV (and its aliases), then the
-            default connection string.
 
-    Returns:
-        List of primary key column names
-    """
-    query = """
-    SELECT kcu.column_name
-    FROM information_schema.table_constraints tc
-    JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-        AND tc.table_schema = kcu.table_schema
-    WHERE tc.constraint_type = 'PRIMARY KEY'
-        AND tc.table_schema = 'public'
-        AND tc.table_name = :table_name
-    ORDER BY kcu.ordinal_position
-    """
-    results = execute_query(query, {"table_name": table_name}, environment=environment)
-    return [row["column_name"] for row in results]
+# ---------- MCP Tools ----------
 
 
 @mcp.tool("health_check")
 def handle_health_check(environment: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Check database connectivity and server health.
-
-    Args:
-        environment: Optional environment to check (defaults to current)
-
-    Returns:
-        Health status with connection info
-    """
+    """Check database connectivity and server health."""
     target_env = _resolve_requested_environment(environment)
     try:
         engine = _get_engine(environment)
-
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT 1"))
-            result.fetchone()
-
+            conn.execute(text("SELECT 1")).fetchone()
         return {
             "status": "healthy",
             "environment": target_env,
-            "available_environments": list(DATABASE_URLS.keys()),
+            "available_environments": sorted(DATABASE_URLS.keys()),
             "pool_size": POOL_SIZE,
             "statement_timeout_ms": DEFAULT_STATEMENT_TIMEOUT_MS,
-            "max_rows": DEFAULT_MAX_ROWS
+            "max_rows": DEFAULT_MAX_ROWS,
+            "allowed_schemas": list(ALLOWED_SCHEMAS),
         }
     except Exception as e:
-        return {
-            "status": "unhealthy",
-            "environment": target_env,
-            "error": str(e)
-        }
+        return {"status": "unhealthy", "environment": target_env, "error": str(e)}
 
 
-# Example MCP tool handler for database queries
 @mcp.tool("database_query")
-def handle_database_query(query: str, environment: Optional[str] = None) -> Dict[str, Any]:
-    """
-    MCP tool to execute a read-only database query.
-
-    Args:
-        query: SQL query to execute (SELECT statements only)
-        environment: Optional environment label to run against. When omitted,
-            falls back to DATABASE_TARGET_ENV (and its aliases), then the
-            default connection string.
-
-    Returns:
-        Dictionary with query results
-    """
+def handle_database_query(
+    query: str,
+    environment: Optional[str] = None,
+    max_rows: Optional[int] = None,
+    offset: int = 0,
+    statement_timeout_ms: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Execute a read-only SQL query (SELECT/WITH only)."""
     try:
-        results = execute_query(query, environment=environment)
-        truncated = len(results) >= DEFAULT_MAX_ROWS
+        rows, truncated = execute_query(
+            query,
+            environment=environment,
+            max_rows=max_rows,
+            offset=offset,
+            statement_timeout_ms=statement_timeout_ms,
+        )
+        effective_max = max_rows if max_rows is not None else DEFAULT_MAX_ROWS
         return {
             "status": "success",
-            "results": results,
-            "count": len(results),
+            "results": rows,
+            "count": len(rows),
             "truncated": truncated,
-            "max_rows": DEFAULT_MAX_ROWS,
-            "statement_timeout_ms": DEFAULT_STATEMENT_TIMEOUT_MS,
+            "offset": offset,
+            "max_rows": effective_max,
+            "statement_timeout_ms": (
+                statement_timeout_ms
+                if statement_timeout_ms is not None
+                else DEFAULT_STATEMENT_TIMEOUT_MS
+            ),
             "environment": _resolve_requested_environment(environment),
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
-# Example MCP tool handler for listing tables
-@mcp.tool("list_tables")
-def handle_list_tables(environment: Optional[str] = None) -> Dict[str, Any]:
+@mcp.tool("explain_query")
+def handle_explain_query(
+    query: str,
+    analyze: bool = False,
+    environment: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    MCP tool to list all tables in the database.
-
-    Args:
-        environment: Optional environment label to inspect. When omitted,
-            falls back to DATABASE_TARGET_ENV (and its aliases), then the
-            default connection string.
-
-    Returns:
-        Dictionary with table names
+    EXPLAIN [ANALYZE] a query. analyze=True runs query for real timings.
+    Always read-only; validator rejects writes.
     """
     try:
-        tables = get_table_names(environment=environment)
-        return {"status": "success", "tables": tables, "count": len(tables)}
+        validate_read_only_sql(query)
+        inner = _strip_trailing_semicolon(query)
+        prefix = "EXPLAIN (FORMAT JSON, ANALYZE)" if analyze else "EXPLAIN (FORMAT JSON)"
+        explain_sql = f"{prefix} {inner}"
+
+        engine = _get_engine(environment)
+        with engine.connect() as conn:
+            trans = conn.begin()
+            try:
+                conn.execute(text("SET TRANSACTION READ ONLY"))
+                conn.execute(
+                    text("SET LOCAL statement_timeout = :t"),
+                    {"t": DEFAULT_STATEMENT_TIMEOUT_MS},
+                )
+                result = conn.execute(text(explain_sql))
+                rows = result.fetchall()
+                plan = [_jsonify_value(r[0]) for r in rows]
+                trans.commit()
+                return {
+                    "status": "success",
+                    "analyze": analyze,
+                    "plan": plan,
+                    "environment": _resolve_requested_environment(environment),
+                }
+            except Exception:
+                trans.rollback()
+                raise
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
-# Example MCP tool handler for getting table schema
-@mcp.tool("get_table_schema")
-def handle_get_table_schema(
-    table_name: str, environment: Optional[str] = None
+@mcp.tool("list_tables")
+def handle_list_tables(
+    environment: Optional[str] = None, schema: Optional[str] = None
 ) -> Dict[str, Any]:
-    """
-    MCP tool to get the schema for a specific table.
-
-    Args:
-        table_name: Name of the table
-        environment: Optional environment label to inspect. When omitted,
-            falls back to DATABASE_TARGET_ENV (and its aliases), then the
-            default connection string.
-
-    Returns:
-        Dictionary with table schema information
-    """
+    """List tables in the given schema (defaults to first allowed schema)."""
     try:
-        schema = get_table_schema(table_name, environment=environment)
-        primary_keys = get_primary_keys(table_name, environment=environment)
-
+        target_schema = _validate_schema(schema)
+        tables = get_table_names(environment=environment, schema=target_schema)
         return {
             "status": "success",
+            "schema": target_schema,
+            "tables": tables,
+            "count": len(tables),
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool("get_table_schema")
+def handle_get_table_schema(
+    table_name: str,
+    environment: Optional[str] = None,
+    schema: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Get column metadata + primary keys for a table."""
+    try:
+        target_schema = _validate_schema(schema)
+        cols = get_table_schema(table_name, environment=environment, schema=target_schema)
+        pks = get_primary_keys(table_name, environment=environment, schema=target_schema)
+        return {
+            "status": "success",
+            "schema": target_schema,
             "table": table_name,
-            "schema": schema,
-            "primary_keys": primary_keys,
+            "columns": cols,
+            "primary_keys": pks,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
 @mcp.tool("get_all_schemas")
-def handle_get_all_schemas(environment: Optional[str] = None) -> Dict[str, Any]:
+def handle_get_all_schemas(
+    environment: Optional[str] = None,
+    schema: Optional[str] = None,
+    include_samples: bool = True,
+    sample_rows: int = 5,
+) -> Dict[str, Any]:
     """
-    MCP tool to get schemas for all tables in the database.
-    This is useful for analyzing the entire database structure at once.
-
-    Args:
-        environment: Optional environment label to inspect. When omitted,
-            falls back to DATABASE_TARGET_ENV (and its aliases), then the
-            default connection string.
-
-    Returns:
-        Dictionary with schema information for all tables
+    Get column + PK info for every table in the schema in 2 queries.
+    Optionally include LIMIT-N samples (one query per table; set include_samples=False to skip).
     """
     try:
-        tables = get_table_names(environment=environment)
-        all_schemas = {}
+        target_schema = _validate_schema(schema)
 
-        for table_name in tables:
-            schema = get_table_schema(table_name, environment=environment)
-            primary_keys = get_primary_keys(table_name, environment=environment)
-            all_schemas[table_name] = {"schema": schema, "primary_keys": primary_keys}
+        cols, _ = execute_query(
+            """
+            SELECT table_name, column_name, data_type, is_nullable,
+                   column_default, character_maximum_length, ordinal_position
+            FROM information_schema.columns
+            WHERE table_schema = :s
+            ORDER BY table_name, ordinal_position
+            """,
+            {"s": target_schema},
+            environment=environment,
+        )
 
-            # Get a sample of data (first 5 rows) for each table
-            try:
-                sample_query = f'SELECT * FROM "{table_name}" LIMIT 5'
-                sample_data = execute_query(sample_query, environment=environment)
-                all_schemas[table_name]["sample_data"] = sample_data
-            except Exception:
-                all_schemas[table_name]["sample_data"] = []
+        pks, _ = execute_query(
+            """
+            SELECT tc.table_name, kcu.column_name, kcu.ordinal_position
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.table_schema = kcu.table_schema
+            WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = :s
+            ORDER BY tc.table_name, kcu.ordinal_position
+            """,
+            {"s": target_schema},
+            environment=environment,
+        )
 
-        return {"status": "success", "table_count": len(tables), "schemas": all_schemas}
+        schemas: Dict[str, Dict[str, Any]] = {}
+        for c in cols:
+            t = c["table_name"]
+            schemas.setdefault(t, {"columns": [], "primary_keys": []})
+            schemas[t]["columns"].append(
+                {k: v for k, v in c.items() if k != "table_name"}
+            )
+        for p in pks:
+            t = p["table_name"]
+            schemas.setdefault(t, {"columns": [], "primary_keys": []})
+            schemas[t]["primary_keys"].append(p["column_name"])
+
+        if include_samples:
+            if sample_rows <= 0 or sample_rows > 100:
+                raise ValueError("sample_rows must be in (0, 100]")
+            qschema = _quote_ident(target_schema)
+            for table_name in list(schemas.keys()):
+                try:
+                    qtable = _quote_ident(table_name)
+                    sample, _ = execute_query(
+                        f"SELECT * FROM {qschema}.{qtable}",
+                        environment=environment,
+                        max_rows=sample_rows,
+                    )
+                    schemas[table_name]["sample_data"] = sample
+                except Exception:
+                    schemas[table_name]["sample_data"] = []
+
+        return {
+            "status": "success",
+            "schema": target_schema,
+            "table_count": len(schemas),
+            "schemas": schemas,
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
-# If this file is run directly, start the MCP server
+def _startup_check_or_exit() -> None:
+    if not DATABASE_URLS:
+        log_event("startup_failed", reason="no_database_urls")
+        print(
+            "ERROR: No database URLs configured.\n"
+            "Set DATABASE_URL or DATABASE_URL_<ENV> environment variables.\n"
+            "Example: DATABASE_URL_LOCAL=postgresql://user:pass@localhost:5432/db",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    log_event("server_starting",
-        environments=list(DATABASE_URLS.keys()),
+    _startup_check_or_exit()
+    log_event(
+        "server_starting",
+        environments=sorted(DATABASE_URLS.keys()),
         statement_timeout_ms=DEFAULT_STATEMENT_TIMEOUT_MS,
         max_rows=DEFAULT_MAX_ROWS,
-        pool_size=POOL_SIZE
+        pool_size=POOL_SIZE,
+        allowed_schemas=list(ALLOWED_SCHEMAS),
     )
     print("Starting Database Read MCP Server...", file=sys.stderr, flush=True)
     print("Available tools:", file=sys.stderr, flush=True)
-    print("  - health_check: Check database connectivity and server health", file=sys.stderr, flush=True)
-    print("  - database_query: Execute read-only SQL queries", file=sys.stderr, flush=True)
-    print("  - list_tables: List all tables in the database", file=sys.stderr, flush=True)
-    print("  - get_table_schema: Get schema for a specific table", file=sys.stderr, flush=True)
-    print("  - get_all_schemas: Get schemas for all tables at once", file=sys.stderr, flush=True)
-    # Use run method with explicit transport parameter for Cursor compatibility
+    for tool in (
+        "health_check",
+        "database_query",
+        "explain_query",
+        "list_tables",
+        "get_table_schema",
+        "get_all_schemas",
+    ):
+        print(f"  - {tool}", file=sys.stderr, flush=True)
     mcp.run(transport="stdio")

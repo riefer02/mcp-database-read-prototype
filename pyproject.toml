@@ -1,10 +1,24 @@
 [project]
 name = "database-read-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "Read-only PostgreSQL MCP server"
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.26.0",
     "sqlalchemy>=2.0.39",
     "psycopg2-binary>=2.9.10",
+    "sqlparse>=0.4.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: requires a real PostgreSQL via MCP_TEST_DATABASE_URL",
 ]

@@ -1,18 +1,20 @@
 # Database Read MCP Server
 
-A simple Model Context Protocol (MCP) server for read-only PostgreSQL database access.
+A Model Context Protocol (MCP) server for read-only PostgreSQL access over stdio.
 
 ## What you get
 
-- **Read-only DB access** over MCP (stdio): list tables, fetch schemas, run `SELECT` queries
-- **Write protection**: blocks `INSERT/UPDATE/DELETE/DROP/CREATE/ALTER/TRUNCATE`
-- **Safety limits**: statement timeouts + hard row caps + streamed fetching
+- Read-only DB access over MCP: list tables, inspect schemas, run `SELECT`/`WITH` queries, `EXPLAIN` plans
+- Parse-based write protection (rejects `INSERT/UPDATE/DELETE/MERGE/DROP/CREATE/ALTER/TRUNCATE` and multi-statement payloads)
+- Per-transaction `READ ONLY` + statement/lock/idle timeouts + hard row caps + streamed batched fetches
+- Per-environment connection pools (local/staging/production/...) selectable per call
+- Schema allowlist (default: `public`)
 
 ## Requirements
 
 - Python 3.10+
-- PostgreSQL database
-- An MCP-compatible client (Cursor, Claude Desktop, Codex, etc.)
+- PostgreSQL
+- An MCP-compatible client (Cursor, Claude Desktop, Codex, ...)
 - [`uv`](https://docs.astral.sh/uv/) for project management
 
 ## Install
@@ -21,28 +23,62 @@ A simple Model Context Protocol (MCP) server for read-only PostgreSQL database a
 uv sync
 ```
 
-## Configure the database connection
+## Connection environment variables
 
-This server discovers database URLs from environment variables:
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | Default connection string |
+| `DATABASE_URL_<ENV>` | Per-environment connection (e.g. `DATABASE_URL_LOCAL`, `DATABASE_URL_STAGING`, `DATABASE_URL_PRODUCTION`) |
+| `DATABASE_TARGET_ENV` | Selects active environment (aliases: `DATABASE_ENV`, `DB_ENV`; values like `dev`/`prod`/`stage` normalize to `local`/`production`/`staging`) |
 
-- **Default**: `DATABASE_URL`
-- **Per-environment**: `DATABASE_URL_<ENV>` (e.g. `DATABASE_URL_LOCAL`, `DATABASE_URL_STAGING`)
+Every MCP tool also accepts an `environment` argument to override per-call without restarting the server.
 
-Environment selection:
+## Safety / tuning environment variables
 
-- **Default environment**: `DATABASE_TARGET_ENV` (also supports `DATABASE_ENV` or `DB_ENV`)
-- **Per-tool override**: each MCP tool accepts optional `environment`
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DB_STATEMENT_TIMEOUT_MS` | `60000` | Per-query timeout |
+| `DB_LOCK_TIMEOUT_MS` | `15000` | Lock acquisition timeout |
+| `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | `60000` | Kills idle-in-txn sessions |
+| `DB_MAX_ROWS` | `10000` | Hard row cap (truncation flagged in response) |
+| `DB_FETCHMANY_SIZE` | `1000` | Batch fetch size while streaming |
+| `DB_POOL_SIZE` | `5` | Connections per environment |
+| `DB_MAX_OVERFLOW` | `2` | Pool overflow |
+| `DB_POOL_TIMEOUT` | `30` | Pool wait timeout (s) |
+| `DB_POOL_RECYCLE` | `1800` | Recycle connections after (s) |
+| `DB_ALLOWED_SCHEMAS` | `public` | Comma-separated schemas exposed to tools |
+
+## Available tools
+
+| Tool | Purpose |
+|------|---------|
+| `health_check` | Database + server connectivity check |
+| `database_query` | Run a read-only SQL query (SELECT/WITH); supports `max_rows`, `offset`, `statement_timeout_ms`, `environment` |
+| `explain_query` | `EXPLAIN [ANALYZE]` for a query, JSON plan |
+| `list_tables` | Tables in the chosen schema |
+| `get_table_schema` | Columns + primary keys for one table |
+| `get_all_schemas` | Bulk dump: columns + primary keys (2 queries total) and optional `sample_data` |
+
+`database_query` response shape:
+
+```json
+{
+  "status": "success",
+  "results": [...],
+  "count": 42,
+  "truncated": false,
+  "offset": 0,
+  "max_rows": 10000,
+  "statement_timeout_ms": 60000,
+  "environment": "default"
+}
+```
 
 ## Client setup
 
 ### Cursor
 
-Cursor reads MCP config from either:
-
-- **Project config**: `.cursor/mcp.json`
-- **Global config**: `~/.cursor/mcp.json`
-
-Example `.cursor/mcp.json`:
+Cursor reads MCP config from `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global).
 
 ```json
 {
@@ -61,19 +97,9 @@ Example `.cursor/mcp.json`:
 }
 ```
 
-Notes:
-
-- Keep **real credentials out of git**; use `${env:...}` and set env vars in your shell/secret manager.
-- Restart Cursor after editing MCP config.
-
 ### Claude Desktop
 
-Claude Desktop reads MCP config from:
-
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows (typical)**: `%AppData%\Claude\claude_desktop_config.json`
-
-Example `claude_desktop_config.json`:
+Config path: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%AppData%\Claude\claude_desktop_config.json` (Windows). Use **absolute paths**.
 
 ```json
 {
@@ -83,39 +109,23 @@ Example `claude_desktop_config.json`:
       "args": ["--directory", "/ABSOLUTE/PATH/TO/mcp-prototype", "run", "database_read.py"],
       "env": {
         "DATABASE_TARGET_ENV": "local",
-        "DATABASE_URL_LOCAL": "postgresql://user:password@localhost:5432/db_name",
-        "DATABASE_URL_STAGING": "postgresql://user:password@staging-host:5432/db_name",
-        "DATABASE_URL_PRODUCTION": "postgresql://user:password@prod-host:5432/db_name"
+        "DATABASE_URL_LOCAL": "postgresql://user:password@localhost:5432/db_name"
       }
     }
   }
 }
 ```
 
-Notes:
-
-- Claude Desktop commonly requires **absolute paths** in JSON.
-- Restart Claude Desktop after editing the config.
-- `DATABASE_TARGET_ENV` sets the default; tools can override per-call with `environment: "staging"` etc.
-
-### OpenAI Codex (CLI + IDE extension)
-
-Codex shares MCP configuration between the CLI and IDE extension via:
-
-- `~/.codex/config.toml`
-
-Option A — configure via CLI:
+### OpenAI Codex
 
 ```bash
 codex mcp add database-reader \
   --env DATABASE_TARGET_ENV=local \
   --env DATABASE_URL_LOCAL='postgresql://user:password@localhost:5432/db_name' \
-  --env DATABASE_URL_STAGING='postgresql://user:password@staging-host:5432/db_name' \
-  --env DATABASE_URL_PRODUCTION='postgresql://user:password@prod-host:5432/db_name' \
   -- uv --directory /ABSOLUTE/PATH/TO/mcp-prototype run database_read.py
 ```
 
-Option B — configure via `~/.codex/config.toml`:
+Or `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.database-reader]
@@ -125,58 +135,32 @@ args = ["--directory", "/ABSOLUTE/PATH/TO/mcp-prototype", "run", "database_read.
 [mcp_servers.database-reader.env]
 DATABASE_TARGET_ENV = "local"
 DATABASE_URL_LOCAL = "postgresql://user:password@localhost:5432/db_name"
-DATABASE_URL_STAGING = "postgresql://user:password@staging-host:5432/db_name"
-DATABASE_URL_PRODUCTION = "postgresql://user:password@prod-host:5432/db_name"
 ```
 
-### Other MCP clients (Claude Code, OpenCode, etc.)
+### Other MCP clients
 
-If your client supports **STDIO MCP servers**, it will typically accept the same fields:
+Any stdio MCP client accepts the same fields: `command = "uv"`, `args = ["--directory", "<repo>", "run", "database_read.py"]`, plus `env` entries for connection URLs.
 
-- `command`: `uv`
-- `args`: `["--directory", "/path/to/mcp-prototype", "run", "database_read.py"]`
-- `env`: environment variables (at least `DATABASE_URL` or `DATABASE_URL_<ENV>`)
+## Switching environments per call
 
-Use the **Cursor / Claude Desktop JSON** examples above (same `mcpServers` shape), or the **Codex `config.toml`** example if your client uses TOML.
-
-## Smoke test (works in any client)
-
-Try these tool calls:
-
-- **list_tables**: confirm you can see tables
-- **get_table_schema**: pick one table and inspect columns + primary keys
-- **database_query**: run a safe query like `SELECT * FROM some_table LIMIT 5`
-
-To test multi-env selection, pass `environment: "staging"` in the tool call arguments (or change `DATABASE_TARGET_ENV`).
-
-## Available Tools
-
-- **health_check**: Check database connectivity and server health
-- **database_query**: Run read-only SQL queries
-- **list_tables**: List all tables in the database
-- **get_table_schema**: Get schema for a specific table (includes primary keys)
-- **get_all_schemas**: Get schemas for all tables (also attempts small sample data)
-
-## Switching between environments
-
-- Define as many connection strings as you need via `DATABASE_URL_<ENV>` (e.g., `DATABASE_URL_LOCAL`, `DATABASE_URL_STAGING`, `DATABASE_URL_PRODUCTION`). `DATABASE_URL` still works as the default when no environment is specified.
-- Tell the server which environment to use globally with `DATABASE_TARGET_ENV` (aliases such as `dev`, `prod`, `stage`, `stg`, `local`, `staging`, `production` are supported). You can also set `DATABASE_ENV` or `DB_ENV` if you prefer those names.
-- Every MCP tool now accepts an optional `environment` argument, so you can ask the agent to run queries against a different database without editing your config. Example:
-
-  ```json
-  {
-    "name": "database_query",
-    "arguments": {
-      "query": "SELECT * FROM users LIMIT 5",
-      "environment": "staging"
-    }
+```json
+{
+  "name": "database_query",
+  "arguments": {
+    "query": "SELECT * FROM users LIMIT 5",
+    "environment": "staging"
   }
-  ```
+}
+```
 
-- The server keeps its own safe connection pool per environment, so switching between local/staging/production reads does not require a restart.
+The server keeps a separate connection pool per environment, so switching does not require a restart.
 
-## Important Notes
+## Tests
 
-- SQLAlchemy requires `postgresql://` not `postgres://` in connection strings
-- Restart your client after adding the configuration
-- Do not commit real credentials; use environment variables or a secret manager in production
+See [CLAUDE.md](./CLAUDE.md#testing) for the regression suite (unit + integration).
+
+## Notes
+
+- SQLAlchemy requires `postgresql://` (not `postgres://`).
+- Restart the MCP client after editing its config.
+- Never commit real credentials; use shell env vars or a secret manager.
